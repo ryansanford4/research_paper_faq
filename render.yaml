@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: research-paper-faq
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false   # set in the Render dashboard (secret)
+      - key: DATABASE_URL
+        sync: false   # set in the Render dashboard (secret)
+      - key: PYTHON_VERSION
+        value: "3.12.7"

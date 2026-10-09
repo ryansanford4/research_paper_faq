@@ -1,15 +1,15 @@
 """Research Paper FAQ — FastAPI app.
 
 Upload or link a research paper, get a Haiku-generated summary,
-and chat about it. Papers and chat history persist in SQLite.
+and chat about it. Papers, summaries, PDFs, and chat history persist in
+Postgres.
 """
 
 import logging
 import re
-from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from app import db, extract, llm
@@ -17,6 +17,17 @@ from app import db, extract, llm
 app = FastAPI(title="Research Paper FAQ")
 
 MAX_PDF_BYTES = 32 * 1024 * 1024  # matches the API's 32 MB request limit
+MAX_BODY_BYTES = MAX_PDF_BYTES + 1024 * 1024  # multipart overhead headroom
+
+
+@app.middleware("http")
+async def limit_request_body(request, call_next):
+    """Reject oversized uploads before Starlette buffers/spools the body."""
+    content_length = request.headers.get("content-length")
+    if content_length and int(content_length) > MAX_BODY_BYTES:
+        return JSONResponse(status_code=413,
+                            content={"detail": "Request body too large (max 32 MB)."})
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -69,13 +80,7 @@ def add_paper(
             summary = "(Summarization failed — check the server log. " \
                       "Is ANTHROPIC_API_KEY set?)"
 
-        paper_id = db.insert_paper(title, source, None, full_text, summary)
-
-        # Save the PDF copy under the final id, then record its path.
-        path = extract.save_pdf(data, str(paper_id))
-        with db.get_conn() as conn:
-            conn.execute("UPDATE papers SET file_path = ? WHERE id = ?",
-                         (str(path), paper_id))
+        paper_id = db.insert_paper(title, source, data, full_text, summary)
 
         return JSONResponse({"id": paper_id, "title": title, "source": source,
                              "summary": summary}, status_code=201)
@@ -93,32 +98,32 @@ def get_paper(paper_id: int):
     paper = db.get_paper(paper_id)
     if not paper:
         raise HTTPException(404, "Paper not found.")
-    paper.pop("full_text", None)  # don't ship 400KB of text to the browser
+    # Don't ship ~400KB of text or the PDF blob to the browser.
+    paper.pop("full_text", None)
+    paper.pop("pdf_bytes", None)
+    paper["created_at"] = paper["created_at"].isoformat()
     paper["messages"] = db.get_messages(paper_id)
     return paper
 
 
 @app.delete("/api/papers/{paper_id}")
 def remove_paper(paper_id: int):
-    paper = db.get_paper(paper_id)
-    if not paper:
+    if not db.get_paper(paper_id):
         raise HTTPException(404, "Paper not found.")
-    if paper.get("file_path"):
-        Path(paper["file_path"]).unlink(missing_ok=True)
     db.delete_paper(paper_id)
     return {"deleted": paper_id}
 
 
 @app.get("/api/papers/{paper_id}/pdf")
 def get_paper_pdf(paper_id: int):
-    paper = db.get_paper(paper_id)
-    if not paper:
+    if not db.get_paper(paper_id):
         raise HTTPException(404, "Paper not found.")
-    if not paper.get("file_path") or not Path(paper["file_path"]).exists():
+    pdf = db.get_paper_pdf(paper_id)
+    if not pdf:
         raise HTTPException(404, "No stored PDF for this paper.")
-    return FileResponse(paper["file_path"], media_type="application/pdf",
-                        filename=f"{paper_id}.pdf",
-                        content_disposition_type="inline")
+    return Response(content=bytes(pdf), media_type="application/pdf",
+                    headers={"Content-Disposition":
+                             f'inline; filename="{paper_id}.pdf"'})
 
 
 @app.post("/api/papers/{paper_id}/chat")
@@ -130,19 +135,38 @@ def chat(paper_id: int, body: dict):
     if not paper:
         raise HTTPException(404, "Paper not found.")
 
-    history = db.get_messages(paper_id)
-    db.add_message(paper_id, "user", question)
+    # Serialize whole turns per paper (session-level advisory lock held
+    # across the model call): concurrent chats on the same paper would
+    # otherwise interleave their user/assistant inserts and corrupt the
+    # stored transcript (and the history the model sees next turn).
+    conn = db.get_conn()
+    conn.execute("SELECT pg_advisory_lock(%s)", (paper_id,))
     try:
-        answer = llm.chat(paper["full_text"], history, question)
-    except Exception:
-        logging.getLogger(__name__).exception("chat failed")
-        raise HTTPException(502, "The model call failed — check the server log.")
-    try:
-        db.add_message(paper_id, "assistant", answer)
-    except Exception:
-        # Paper was deleted mid-chat; nothing left to store for.
-        logging.getLogger(__name__).warning("paper %s vanished mid-chat", paper_id)
-        return {"role": "assistant", "content": answer}
+        history = conn.execute(
+            "SELECT role, content FROM messages WHERE paper_id = %s ORDER BY id",
+            (paper_id,),
+        ).fetchall()
+        conn.execute(
+            "INSERT INTO messages (paper_id, role, content) VALUES (%s, %s, %s)",
+            (paper_id, "user", question),
+        )
+        try:
+            answer = llm.chat(paper["full_text"], history, question)
+        except Exception:
+            logging.getLogger(__name__).exception("chat failed")
+            raise HTTPException(502, "The model call failed — check the server log.")
+        try:
+            conn.execute(
+                "INSERT INTO messages (paper_id, role, content) VALUES (%s, %s, %s)",
+                (paper_id, "assistant", answer),
+            )
+        except Exception:
+            # Paper was deleted mid-chat; nothing left to store for.
+            logging.getLogger(__name__).warning(
+                "paper %s vanished mid-chat", paper_id)
+    finally:
+        conn.execute("SELECT pg_advisory_unlock(%s)", (paper_id,))
+        conn.close()
     return {"role": "assistant", "content": answer}
 
 

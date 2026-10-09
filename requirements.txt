@@ -4,3 +4,4 @@ uvicorn[standard]
 pypdf
 httpx2
 python-multipart
+psycopg[binary]

@@ -3,16 +3,14 @@
 import ipaddress
 import re
 import socket
-from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx2 as httpx
 from pypdf import PdfReader
 
-from app.db import FILES_DIR
-
 MAX_TEXT_CHARS = 400_000  # hard ceiling: ~100k tokens, well inside Haiku's 1M window
 MAX_PDF_BYTES = 32 * 1024 * 1024
+MAX_REDIRECTS = 5
 
 ARXIV_PATTERNS = [
     # https://arxiv.org/abs/2401.12345 or /pdf/2401.12345
@@ -33,6 +31,8 @@ def _host_is_public(hostname: str) -> bool:
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
+        return False
+    if not infos:
         return False
     return all(ipaddress.ip_address(i[4][0]).is_global for i in infos)
 
@@ -92,23 +92,35 @@ def fetch_pdf_from_url(url: str) -> tuple[str, str, bytes]:
     # arXiv likes a real-looking User-Agent.
     headers = {"User-Agent": "research-paper-faq/1.0 (mailto:ryansanford4@gmail.com)"}
     try:
-        with httpx.Client(follow_redirects=True, timeout=60.0) as client:
-            with client.stream("GET", target, headers=headers) as resp:
-                resp.raise_for_status()
-                # Re-check the host we actually landed on after redirects.
-                check_url_target(str(resp.url))
-                content_type = resp.headers.get("content-type", "")
-                content_length = resp.headers.get("content-length")
-                if content_length and int(content_length) > MAX_PDF_BYTES:
-                    raise ValueError("Downloaded PDF exceeds the 32 MB limit.")
-                # Stream with a cap so a huge body can't exhaust memory.
-                chunks, size = [], 0
-                for chunk in resp.iter_bytes(1024 * 1024):
-                    size += len(chunk)
-                    if size > MAX_PDF_BYTES:
+        # Follow redirects manually so every hop's host is validated BEFORE
+        # we connect to it — httpx's automatic redirects would fetch first
+        # and let us check only afterwards.
+        with httpx.Client(follow_redirects=False, timeout=60.0) as client:
+            for _ in range(MAX_REDIRECTS + 1):
+                with client.stream("GET", target, headers=headers) as resp:
+                    if resp.is_redirect:
+                        location = resp.headers.get("location")
+                        if not location:
+                            raise ValueError("Redirect without a Location header.")
+                        target = str(httpx.URL(target).join(location))
+                        check_url_target(target)  # validate the hop before fetching it
+                        continue
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "")
+                    content_length = resp.headers.get("content-length")
+                    if content_length and int(content_length) > MAX_PDF_BYTES:
                         raise ValueError("Downloaded PDF exceeds the 32 MB limit.")
-                    chunks.append(chunk)
-                data = b"".join(chunks)
+                    # Stream with a cap so a huge body can't exhaust memory.
+                    chunks, size = [], 0
+                    for chunk in resp.iter_bytes(1024 * 1024):
+                        size += len(chunk)
+                        if size > MAX_PDF_BYTES:
+                            raise ValueError("Downloaded PDF exceeds the 32 MB limit.")
+                        chunks.append(chunk)
+                    data = b"".join(chunks)
+                    break
+            else:
+                raise ValueError("Too many redirects.")
     except httpx.HTTPError as e:
         raise ValueError(f"Could not download {target}: {e}") from e
 
@@ -118,10 +130,3 @@ def fetch_pdf_from_url(url: str) -> tuple[str, str, bytes]:
             "Paste an arXiv abs/pdf link or a direct .pdf URL."
         )
     return target, url, data
-
-
-def save_pdf(data: bytes, paper_id_hint: str) -> Path:
-    """Persist a local copy of the PDF so it can be re-opened later."""
-    path = FILES_DIR / f"{paper_id_hint}.pdf"
-    path.write_bytes(data)
-    return path
