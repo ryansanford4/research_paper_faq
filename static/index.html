@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Research Paper FAQ</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1f2328; --muted: #6e7781;
+    --accent: #b5460f; --accent-ink: #ffffff; --line: #e4e4e1;
+    --user-bubble: #f0eee9; --err: #b3261e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 15px/1.6 -apple-system, "Segoe UI", Roboto, sans-serif;
+         background: var(--bg); color: var(--ink); }
+  header { padding: 18px 24px; border-bottom: 1px solid var(--line);
+           background: var(--panel); }
+  header h1 { margin: 0; font-size: 20px; }
+  header p { margin: 2px 0 0; color: var(--muted); font-size: 13px; }
+  .layout { display: grid; grid-template-columns: 320px 1fr; min-height: calc(100vh - 74px); }
+  aside { border-right: 1px solid var(--line); background: var(--panel); padding: 16px; overflow-y: auto; }
+  main { display: flex; flex-direction: column; }
+  .add-box { border: 1px dashed var(--line); border-radius: 10px; padding: 12px; margin-bottom: 16px; }
+  .add-box input[type=url], .add-box input[type=file] { width: 100%; margin: 6px 0; }
+  .add-box button, .chat-input button { background: var(--accent); color: var(--accent-ink);
+    border: 0; border-radius: 8px; padding: 8px 14px; font-size: 14px; cursor: pointer; }
+  .add-box button:disabled, .chat-input button:disabled { opacity: .5; cursor: default; }
+  .paper-item { padding: 10px 12px; border-radius: 8px; cursor: pointer; margin-bottom: 6px; }
+  .paper-item:hover { background: var(--bg); }
+  .paper-item.active { background: var(--bg); outline: 1px solid var(--line); }
+  .paper-item .t { font-weight: 600; font-size: 14px; }
+  .paper-item .s { color: var(--muted); font-size: 12px; word-break: break-all; }
+  .paper-item .del { float: right; color: var(--muted); border: 0; background: none;
+    cursor: pointer; font-size: 13px; }
+  .content { flex: 1; overflow-y: auto; padding: 24px 32px; }
+  .summary h2 { font-size: 18px; margin-top: 0; }
+  .summary-body { background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 16px 20px; max-width: 860px; }
+  .summary-body h3, .msg h3 { font-size: 15px; margin: 14px 0 4px; }
+  .summary-body p, .msg p { margin: 6px 0; }
+  .meta { color: var(--muted); font-size: 12.5px; margin-bottom: 10px; }
+  .meta a { color: var(--accent); }
+  .chat { max-width: 860px; margin-top: 24px; }
+  .chat h2 { font-size: 16px; }
+  .msg { border-radius: 10px; padding: 10px 14px; margin: 8px 0; max-width: 85%; }
+  .msg.user { background: var(--user-bubble); margin-left: auto; }
+  .msg.assistant { background: var(--panel); border: 1px solid var(--line); }
+  .msg.pending { color: var(--muted); font-style: italic; }
+  .chat-input { display: flex; gap: 8px; padding: 12px 0 24px; max-width: 860px; }
+  .chat-input input { flex: 1; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 8px; font: inherit; }
+  .error { color: var(--err); font-size: 13px; margin-top: 6px; }
+  .empty { color: var(--muted); margin: 60px auto; text-align: center; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Research Paper FAQ</h1>
+  <p>Upload a paper or paste an arXiv link — Haiku summarizes it, then ask it anything.</p>
+</header>
+<div class="layout">
+  <aside>
+    <form class="add-box" id="addForm">
+      <label><b>Add a paper</b></label>
+      <input type="url" id="urlInput" placeholder="https://arxiv.org/abs/...">
+      <input type="file" id="fileInput" accept="application/pdf">
+      <button type="submit" id="addBtn">Add &amp; summarize</button>
+      <div class="error hidden" id="addError"></div>
+    </form>
+    <div id="paperList"></div>
+  </aside>
+  <main>
+    <div class="content" id="content">
+      <div class="empty">Select a paper, or add one to get started.</div>
+    </div>
+    <div class="chat-input hidden" id="chatBar">
+      <input id="chatInput" placeholder="Ask a question about this paper…">
+      <button id="chatBtn">Send</button>
+    </div>
+  </main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+let papers = [], currentId = null, sending = false;
+
+// Minimal, safe Markdown renderer: escape HTML first, then add formatting.
+function md(src) {
+  const esc = (s) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const inline = (s) => esc(s)
+    .replace(/\*\*([^*]+)\*\*/g, '<b>$1</b>')
+    .replace(/\*([^*]+)\*/g, '<i>$1</i>')
+    .replace(/`([^`]+)`/g, '<code>$1</code>');
+  const out = [];
+  let para = [];
+  const flush = () => {
+    if (para.length) { out.push('<p>' + para.map(inline).join('<br>') + '</p>'); para = []; }
+  };
+  for (const line of String(src).split('\n')) {
+    const t = line.trim();
+    if (!t) { flush(); continue; }
+    const h = t.match(/^(#{1,4})\s+(.*)$/);
+    if (h) { flush(); out.push(`<h3>${inline(h[2])}</h3>`); continue; }
+    const li = t.match(/^[-*]\s+(.*)$/);
+    if (li) { flush(); out.push('<ul><li>' + inline(li[1]) + '</li></ul>'); continue; }
+    para.push(t);
+  }
+  flush();
+  return out.join('');
+}
+
+async function getJSON(url, opts) {
+  const resp = await fetch(url, opts);
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(typeof data.detail === 'string' ? data.detail
+                                     : `Request failed (${resp.status})`);
+  return data;
+}
+
+async function refreshList() {
+  try {
+    papers = await getJSON('/api/papers');
+  } catch (err) {
+    console.error('refreshList:', err);
+    return;
+  }
+  const list = $('paperList');
+  list.innerHTML = '';
+  for (const p of papers) {
+    const el = document.createElement('div');
+    el.className = 'paper-item' + (p.id === currentId ? ' active' : '');
+    const del = document.createElement('button');
+    del.className = 'del'; del.textContent = '✕'; del.title = 'Delete';
+    del.disabled = sending; del.title = del.disabled ? 'Wait for the chat reply first' : 'Delete';
+    del.onclick = async (e) => {
+      e.stopPropagation();
+      del.disabled = true;
+      try {
+        await fetch('/api/papers/' + p.id, {method: 'DELETE'});
+      } catch (err) { console.error(err); return; }
+      if (currentId === p.id) { currentId = null; renderPaper(null); }
+      refreshList();
+    };
+    const t = document.createElement('div'); t.className = 't'; t.textContent = p.title;
+    const s = document.createElement('div'); s.className = 's'; s.textContent = p.source;
+    el.append(del, t, s);
+    el.onclick = () => openPaper(p.id);
+    list.append(el);
+  }
+}
+
+async function openPaper(id) {
+  currentId = id;  // last click wins; guard against stale responses below
+  let p;
+  try {
+    p = await getJSON('/api/papers/' + id);
+  } catch (err) {
+    if (currentId === id) renderError(err.message);
+    return;
+  }
+  if (currentId !== id) return;  // user clicked another paper meanwhile
+  renderPaper(p);
+  refreshList();
+}
+
+function renderError(message) {
+  currentId = null;
+  $('chatBar').classList.add('hidden');
+  $('content').innerHTML = `<div class="empty"></div>`;
+  $('content').firstChild.textContent = message;
+}
+
+function renderPaper(p) {
+  const content = $('content');
+  const chatBar = $('chatBar');
+  if (!p) { content.innerHTML = '<div class="empty">Select a paper, or add one to get started.</div>';
+            chatBar.classList.add('hidden'); return; }
+  chatBar.classList.remove('hidden');
+  content.innerHTML = `
+    <div class="summary">
+      <h2></h2>
+      <div class="meta"></div>
+      <div class="summary-body"></div>
+    </div>
+    <div class="chat"><h2>Ask about this paper</h2><div id="msgs"></div></div>`;
+  content.querySelector('h2').textContent = p.title;
+  const meta = content.querySelector('.meta');
+  if (p.source.startsWith('http')) {
+    const a = document.createElement('a'); a.href = p.source; a.target = '_blank'; a.textContent = p.source;
+    meta.append('Source: ', a, ` · added ${p.created_at}`);
+  } else {
+    meta.textContent = `Uploaded as “${p.source}” · added ${p.created_at}`;
+  }
+  const pdfLink = document.createElement('a');
+  pdfLink.href = `/api/papers/${p.id}/pdf`; pdfLink.textContent = 'View PDF';
+  pdfLink.target = '_blank'; meta.append(' · '); meta.append(pdfLink);
+
+  content.querySelector('.summary-body').innerHTML = md(p.summary);
+  const msgs = $('msgs');
+  for (const m of p.messages) addMsgEl(msgs, m.role, m.content);
+  scrollToBottom();
+}
+
+function addMsgEl(container, role, text, pending) {
+  const el = document.createElement('div');
+  el.className = 'msg ' + role + (pending ? ' pending' : '');
+  if (pending) el.textContent = 'Thinking…';
+  else el.innerHTML = md(text);
+  container.append(el);
+  return el;
+}
+
+function scrollToBottom() {
+  const el = $('msgs');
+  if (el && el.lastChild) el.lastChild.scrollIntoView({block: 'end'});
+}
+
+$('addForm').onsubmit = async (e) => {
+  e.preventDefault();
+  const errEl = $('addError'); errEl.classList.add('hidden');
+  const url = $('urlInput').value.trim();
+  const file = $('fileInput').files[0];
+  // A typed URL takes precedence over a possibly stale file selection.
+  if (!url && !file) { errEl.textContent = 'Paste a URL or choose a PDF.'; errEl.classList.remove('hidden'); return; }
+  $('addBtn').disabled = true; $('addBtn').textContent = 'Summarizing…';
+  try {
+    let data;
+    if (url) {
+      data = await getJSON('/api/papers', {method: 'POST',
+        body: new URLSearchParams({url})});
+    } else {
+      const fd = new FormData(); fd.append('file', file);
+      data = await getJSON('/api/papers', {method: 'POST', body: fd});
+    }
+    $('urlInput').value = ''; $('fileInput').value = '';
+    currentId = data.id;
+    renderPaper(await getJSON('/api/papers/' + data.id));
+    await refreshList();
+  } catch (err) {
+    errEl.textContent = err.message; errEl.classList.remove('hidden');
+  } finally {
+    $('addBtn').disabled = false; $('addBtn').textContent = 'Add & summarize';
+  }
+};
+
+async function sendChat() {
+  if (sending || !currentId) return;  // in-flight guard (Enter bypasses the button)
+  const input = $('chatInput');
+  const q = input.value.trim();
+  if (!q) return;
+  sending = true;
+  const targetId = currentId;  // chat is bound to the paper shown when sent
+  $('chatBtn').disabled = true;
+  input.value = '';
+  const msgs = $('msgs');
+  addMsgEl(msgs, 'user', q);
+  const pend = addMsgEl(msgs, 'assistant', '', true);
+  scrollToBottom();
+  try {
+    const data = await getJSON(`/api/papers/${targetId}/chat`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({question: q}),
+    });
+    if (pend.isConnected) {  // pane still shows this paper?
+      pend.classList.remove('pending'); pend.innerHTML = md(data.content);
+      scrollToBottom();
+    }
+  } catch (err) {
+    if (pend.isConnected) {
+      pend.classList.remove('pending');
+      pend.textContent = 'Error: ' + err.message;
+      scrollToBottom();
+    }
+  } finally {
+    sending = false;
+    if (currentId !== null) $('chatBtn').disabled = false;
+    input.focus();
+  }
+}
+$('chatBtn').onclick = sendChat;
+$('chatInput').onkeydown = (e) => { if (e.key === 'Enter') sendChat(); };
+
+refreshList();
+</script>
+</body>
+</html>
